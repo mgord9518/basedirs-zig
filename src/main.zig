@@ -42,9 +42,13 @@ pub const BaseDirs = struct {
 
         const logname = env.get("LOGNAME") orelse "";
 
+        var uid: u32 = undefined;
+
         // Assume UID 1000 if unknown
-        const user = std.process.getUserInfo(logname) catch std.process.UserInfo{ .gid = 1000, .uid = 1000 };
-        const uid = user.uid;
+        if (builtin.os.tag != .windows) {
+            const user = std.process.getUserInfo(logname) catch std.process.UserInfo{ .gid = 1000, .uid = 1000 };
+            uid = user.uid;
+        }
 
         return switch (builtin.os.tag) {
             // TODO: properly implement fallbacks
