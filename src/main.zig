@@ -8,7 +8,7 @@ const builtin = @import("builtin");
 
 /// Layout based on the XDG base specification.
 /// Some systems may reuse the same direc
-const BaseDirs = struct {
+pub const BaseDirs = struct {
     //  allocator: std.mem.Allocator,
     home: []const u8,
     data: []const u8,
