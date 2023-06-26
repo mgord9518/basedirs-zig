@@ -5,11 +5,51 @@
 const std = @import("std");
 const fmt = std.fmt;
 const builtin = @import("builtin");
+const os = std.os;
 
-/// Layout based on the XDG base specification.
-/// Some systems may reuse the same direc
+pub fn exePath(buf: []u8) ![]const u8 {
+    return switch (builtin.os.tag) {
+        .linux => try os.readlink("/proc/self/exe", buf),
+        .netbsd => try os.readlink("/proc/curproc/exe", buf),
+        .dragonfly => try os.readlink("/proc/self/file", buf),
+        .solaris => try os.readlink("/proc/self/a.out", buf),
+        .macos, .ios => blk: {
+            const DarwinPathError = error{
+                NoSpaceLeft,
+            };
+
+            const err = os.darwin._NSGetExecutablePath(buf.ptr, buf.len);
+            break :blk if (err == 0) std.mem.span(buf.ptr) else DarwinPathError.NoSpaceLeft;
+        },
+        .windows => blk: {
+            // Windows uses WTF-16 encoding, so it has to be converted to UTF-8
+            // before returning
+            var buf_w: [os.windows.PATH_MAX_WIDE]u16 = undefined;
+
+            const exe_path_w = try os.windows.GetModuleFileNameW(
+                null,
+                &buf_w,
+                buf_w.len,
+            );
+
+            var it = std.unicode.Utf16LeIterator.init(exe_path_w);
+            var len: usize = 0;
+
+            while (try it.nextCodepoint()) |codepoint| {
+                const l = try std.unicode.utf8Encode(codepoint, buf[len..]);
+                len += l;
+            }
+
+            break :blk buf[0..len];
+        },
+        else => @compileError("exePath not yet implemented for target OS"),
+    };
+}
+
 pub const BaseDirs = struct {
-    //  allocator: std.mem.Allocator,
+    /// Layout based on the XDG base specification.
+    /// Some systems may reuse the same direc
+    allocator: std.mem.Allocator,
     home: []const u8,
     data: []const u8,
     config: []const u8,
@@ -27,7 +67,7 @@ pub const BaseDirs = struct {
 
     /// Read current values via enviornment variables
     /// System-level paths not yet supported
-    pub fn init(allocator: std.mem.Allocator, magnitude: BaseDirs.Magnitude) !BaseDirs {
+    pub fn init(allocator: std.mem.Allocator, magnitude: Magnitude) !BaseDirs {
         _ = magnitude;
 
         const env = try std.process.getEnvMap(allocator);
@@ -42,26 +82,26 @@ pub const BaseDirs = struct {
 
         const logname = env.get("LOGNAME") orelse "";
 
-        var uid: u32 = undefined;
-
         // Assume UID 1000 if unknown
-        if (builtin.os.tag != .windows) {
+        const uid = if (builtin.os.tag != .windows) blk: {
             const user = std.process.getUserInfo(logname) catch std.process.UserInfo{ .gid = 1000, .uid = 1000 };
-            uid = user.uid;
-        }
+            break :blk user.uid;
+        };
 
         return switch (builtin.os.tag) {
             // TODO: properly implement fallbacks
             .windows => .{
+                .allocator = allocator,
                 .home = home,
                 .data = env.get("APPDATA") orelse "",
                 .config = env.get("APPDATA") orelse "",
                 .cache = env.get("TEMP") orelse "",
                 .state = env.get("LOCALAPPDATA") orelse "",
                 .runtime = env.get("TEMP") orelse "",
-                .bin = env.get("TEMP") orelse "",
+                .bin = env.get("BIN") orelse "\\Windows\\system32",
             },
             .macos => .{
+                .allocator = allocator,
                 .home = home,
                 .data = try fmt.allocPrint(allocator, "{s}/Library", .{home}),
                 .config = try fmt.allocPrint(allocator, "{s}/Library/Preferences", .{home}),
@@ -73,6 +113,7 @@ pub const BaseDirs = struct {
             // Assumes modern *nix XDG standards
             // TODO: create correct fallbacks for other non-*nix OSes like Haiku
             else => .{
+                .allocator = allocator,
                 .home = home,
                 .data = env.get("XDG_DATA_HOME") orelse try fmt.allocPrint(allocator, "{s}/.local/share", .{home}),
                 .config = env.get("XDG_CONFIG_HOME") orelse try fmt.allocPrint(allocator, "{s}/.config", .{home}),
@@ -84,4 +125,9 @@ pub const BaseDirs = struct {
             },
         };
     }
+
+    // TODO: implement
+    //pub fn deinit(self: *BaseDirs) void {
+    //    self.allocator.free(self.home);
+    //}
 };
