@@ -7,48 +7,10 @@ const fmt = std.fmt;
 const builtin = @import("builtin");
 const os = std.os;
 
-pub fn exePath(buf: []u8) ![]const u8 {
-    return switch (builtin.os.tag) {
-        .linux => try os.readlink("/proc/self/exe", buf),
-        .netbsd => try os.readlink("/proc/curproc/exe", buf),
-        .dragonfly => try os.readlink("/proc/self/file", buf),
-        .solaris => try os.readlink("/proc/self/a.out", buf),
-        .macos, .ios => blk: {
-            const DarwinPathError = error{
-                NoSpaceLeft,
-            };
-
-            const err = os.darwin._NSGetExecutablePath(buf.ptr, buf.len);
-            break :blk if (err == 0) std.mem.span(buf.ptr) else DarwinPathError.NoSpaceLeft;
-        },
-        .windows => blk: {
-            // Windows uses WTF-16 encoding, so it has to be converted to UTF-8
-            // before returning
-            var buf_w: [os.windows.PATH_MAX_WIDE]u16 = undefined;
-
-            const exe_path_w = try os.windows.GetModuleFileNameW(
-                null,
-                &buf_w,
-                buf_w.len,
-            );
-
-            var it = std.unicode.Utf16LeIterator.init(exe_path_w);
-            var len: usize = 0;
-
-            while (try it.nextCodepoint()) |codepoint| {
-                const l = try std.unicode.utf8Encode(codepoint, buf[len..]);
-                len += l;
-            }
-
-            break :blk buf[0..len];
-        },
-        else => @compileError("exePath not yet implemented for target OS"),
-    };
-}
-
+/// Layout based on the XDG base specification.
+/// Some systems may reuse the same directories for different basedirs as there
+/// is no 1:1 reflection on all common systems
 pub const BaseDirs = struct {
-    /// Layout based on the XDG base specification.
-    /// Some systems may reuse the same direc
     allocator: std.mem.Allocator,
     home: []const u8,
     data: []const u8,
@@ -58,27 +20,10 @@ pub const BaseDirs = struct {
     runtime: []const u8,
     bin: []const u8,
 
-    /// User vs system integration
-    /// NYI
-    const Magnitude = enum {
-        user,
-        system,
-    };
-
     /// Read current values via enviornment variables
-    /// System-level paths not yet supported
-    pub fn init(allocator: std.mem.Allocator, magnitude: Magnitude) !BaseDirs {
-        _ = magnitude;
-
-        const env = try std.process.getEnvMap(allocator);
-
-        // TODO: if $HOME not found, fall back on `/etc/passwd` and non-*nix equivilants
-        const home = switch (builtin.os.tag) {
-            .windows => env.get("HOMEPATH") orelse "",
-            .plan9 => env.get("home") orelse "",
-            .haiku => "/boot/home",
-            else => env.get("HOME") orelse "",
-        };
+    pub fn init(allocator: std.mem.Allocator) !BaseDirs {
+        var env = try std.process.getEnvMap(allocator);
+        //defer env.deinit();
 
         const logname = env.get("LOGNAME") orelse "";
 
@@ -88,17 +33,28 @@ pub const BaseDirs = struct {
             break :blk user.uid;
         };
 
+        // TODO: if $HOME not found, fall back on `/etc/passwd` and non-*nix equivilants
+        const home = switch (builtin.os.tag) {
+            .windows => env.get("USERPROFILE") orelse "",
+            .plan9 => env.get("home") orelse try homeFromPasswd(0),
+            .haiku => "/boot/home",
+            else => env.get("HOME") orelse try homeFromPasswd(uid),
+        };
+
         return switch (builtin.os.tag) {
             // TODO: properly implement fallbacks
-            .windows => .{
-                .allocator = allocator,
-                .home = home,
-                .data = env.get("APPDATA") orelse "",
-                .config = env.get("APPDATA") orelse "",
-                .cache = env.get("TEMP") orelse "",
-                .state = env.get("LOCALAPPDATA") orelse "",
-                .runtime = env.get("TEMP") orelse "",
-                .bin = env.get("BIN") orelse "\\Windows\\system32",
+            .windows => blk: {
+                const homedrive = env.get("HOMEDRIVE") orelse "C:";
+                break :blk .{
+                    .allocator = allocator,
+                    .home = home,
+                    .data = env.get("APPDATA") orelse "",
+                    .config = env.get("APPDATA") orelse "",
+                    .cache = env.get("TEMP") orelse "",
+                    .state = env.get("LOCALAPPDATA") orelse "",
+                    .runtime = env.get("TEMP") orelse "",
+                    .bin = env.get("BIN") orelse try fmt.allocPrint(allocator, "{s}\\Windows\\system32", .{homedrive}),
+                };
             },
             .macos => .{
                 .allocator = allocator,
@@ -131,3 +87,54 @@ pub const BaseDirs = struct {
     //    self.allocator.free(self.home);
     //}
 };
+
+// Parses homedir from `/etc/passwd` on POSIX systems
+fn homeFromPasswd(uid: std.os.uid_t) ![]const u8 {
+    // This should be more than enough for even incredibly long entries
+    // On my system the longest was <100 chars, but this should eventually have
+    // a heap-allocated fallback if for some reason a line exceeds this buffer
+    var buf: [512]u8 = undefined;
+
+    var cwd = std.fs.cwd();
+
+    var passwd = try cwd.openFile("/etc/passwd", .{});
+    var stream = std.io.bufferedReader(passwd.reader());
+    var buf_stream = stream.reader();
+
+    while (try buf_stream.readUntilDelimiterOrEof(&buf, '\n')) |line| {
+        var it = std.mem.splitScalar(u8, line, ':');
+
+        var uid_found = false;
+        var idx: usize = 0;
+        while (it.next()) |token| {
+            // UID field of passwd
+            if (idx == 2) {
+                const parsed_uid = try std.fmt.parseInt(std.os.uid_t, token, 10);
+
+                uid_found = (parsed_uid == uid);
+            }
+
+            //std.debug.print("{} ", .{uid_found});
+
+            // If the current line doesn't have our wanted UID, there's no
+            // reason to continue parsing it, so skip to the next line
+            //
+            // TODO: fix this. For some reason it doesn't recognize the block
+            // when placed in the parent loop
+            if (idx >= 2 and !uid_found) {
+                idx += 1;
+                //continue :blk;
+                continue;
+            }
+
+            // Home directory field of passwd
+            if (uid_found and idx == 5) {
+                return token;
+            }
+
+            idx += 1;
+        }
+    }
+
+    unreachable;
+}

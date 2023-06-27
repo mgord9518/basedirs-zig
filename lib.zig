@@ -1,4 +1,1 @@
-const basedirs = @import("lib/basedirs.zig");
-
-pub const exePath = basedirs.exePath;
-pub const BaseDirs = basedirs.BaseDirs;
+pub const BaseDirs = @import("lib/basedirs.zig").BaseDirs;
