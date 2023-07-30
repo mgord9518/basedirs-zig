@@ -11,9 +11,6 @@ jobs:
     - uses: actions/checkout@v2
     - uses: goto-bus-stop/setup-zig@v2
 
-    - name: Install deps
-      run: ./resources/install_deps.sh
-
     - name: Test
       run: zig build test
 
